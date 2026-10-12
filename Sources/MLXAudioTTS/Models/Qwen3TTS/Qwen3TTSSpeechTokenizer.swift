@@ -31,7 +31,7 @@ final class VectorQuantization: Module {
     }
 }
 
-/// SCRATCH (voicepack-check): when true, RVQ decode accumulates in the layer dtype (fp16) instead of fp32.
+/// When true, RVQ decode accumulates in the layer dtype (fp16) instead of fp32.
 nonisolated(unsafe) public var qwen3TTSKeepRVQDtype = false
 
 final class ResidualVectorQuantization: Module {
@@ -45,7 +45,7 @@ final class ResidualVectorQuantization: Module {
 
     func decode(_ codes: MLXArray) -> MLXArray {
         // codes: [num_quantizers, batch, time]
-        // SCRATCH (voicepack-check): optional keep-dtype accumulator. Stock code starts from a float32 zeros
+        // Optional keep-dtype accumulator. Stock code starts from a float32 zeros
         // tensor, which promotes the whole decoder to float32 even with float16 weights.
         var quantized: MLXArray? = qwen3TTSKeepRVQDtype
             ? nil
@@ -1047,7 +1047,7 @@ final class Qwen3TTSSpeechTokenizer: Module {
     @ModuleInfo var decoder: Qwen3TTSSpeechTokenizerDecoder
     @ModuleInfo(key: "encoder_model") var encoderModel: Qwen3TTSSpeechTokenizerEncoder?
 
-    init(config: Qwen3TTSTokenizerConfig, buildEncoder: Bool = true) { // SCRATCH (voicepack-check): buildEncoder
+    init(config: Qwen3TTSTokenizerConfig, buildEncoder: Bool = true) {
         self.config = config
         self.decodeUpsampleRate = config.decodeUpsampleRate
         let decoderConfig = config.decoderConfig ?? {

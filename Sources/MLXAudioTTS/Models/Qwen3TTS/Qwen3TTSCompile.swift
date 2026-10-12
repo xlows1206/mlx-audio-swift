@@ -1,4 +1,5 @@
-// SCRATCH (cpcompile): compiled code-predictor frame. All behaviour is behind `qwen3TTSCompileCP` (default 0 = off).
+// Compiled code-predictor frame (mx.compile over the 15 sub-steps). All behaviour is behind `qwen3TTSCompileCP` (default 0 = off).
+// Weights are captured as constants of the compiled graph, so the compiled closures are cached per model instance.
 import Foundation
 @preconcurrency import MLX
 @preconcurrency import MLXLMCommon
@@ -7,8 +8,6 @@ import MLXRandom
 
 /// 0 = off (stock path), 1 = compile each code-predictor sub-step (incl. sampling), 2 = compile the whole 15-sub-step frame.
 nonisolated(unsafe) public var qwen3TTSCompileCP = 0
-/// Debug tap: called with (subStepIndex, logits[1,1,vocab]) for every code-predictor sub-step (any mode). nil = no tap, no extra outputs.
-nonisolated(unsafe) public var qwen3TTSCPLogitsTap: ((Int, MLXArray) -> Void)? = nil
 
 // MARK: functional (cache-as-arrays) forward, mirrors the stock modules op-for-op
 
@@ -71,7 +70,7 @@ extension Qwen3TTSCodePredictor {
     }
 }
 
-// MARK: compiled closures, cached per (model, sampling params, tap)
+// MARK: compiled closures, cached per (model, sampling params)
 
 final class Qwen3CPCompileStore: @unchecked Sendable {
     nonisolated(unsafe) static let shared = Qwen3CPCompileStore()
@@ -82,18 +81,16 @@ final class Qwen3CPCompileStore: @unchecked Sendable {
 
 extension Qwen3TTSModel {
     private func cpStoreKey(_ mode: Int, _ t: Float, _ p: Float, _ k: Int, _ m: Float) -> String {
-        let tap = qwen3TTSCPLogitsTap != nil
-        return "\(ObjectIdentifier(self).hashValue)|\(mode)|\(t)|\(p)|\(k)|\(m)|\(tap)"
+        return "\(ObjectIdentifier(self).hashValue)|\(mode)|\(t)|\(p)|\(k)|\(m)"
     }
 
-    /// Mode 2. Returns the 15 sampled code tokens ([1,1] each) of one frame; if tap is set, also taps the logits.
+    /// Mode 2. Returns the 15 sampled code tokens ([1,1] each) of one frame.
     func cpCompiledFrame(
         codeHidden: MLXArray, nextToken: MLXArray, temperature: Float, topP: Float, topK: Int, minP: Float
     ) -> [MLXArray] {
         let store = Qwen3CPCompileStore.shared
         let key = cpStoreKey(2, temperature, topP, topK, minP)
         if store.key != key { store.key = key; store.frame = nil; store.sub = [:] }
-        let tapOn = qwen3TTSCPLogitsTap != nil
         let nGroups = talker.codePredictor.numCodeGroups
         if store.frame == nil {
             let cp = talker.codePredictor
@@ -103,7 +100,7 @@ extension Qwen3TTSModel {
                 let hidden = args[0], tok0 = args[1]
                 var kc = [MLXArray?](repeating: nil, count: nLayers)
                 var vc = [MLXArray?](repeating: nil, count: nLayers)
-                var codes = [MLXArray](), logitsOut = [MLXArray]()
+                var codes = [MLXArray]()
                 var last = tok0
                 for codeIdx in 0 ..< nGroups - 1 {
                     let input: MLXArray
@@ -116,15 +113,11 @@ extension Qwen3TTSModel {
                     kc = nk; vc = nv
                     let c = self.sampleToken(lg, temperature: temperature, topP: topP, topK: topK, minP: minP)
                     codes.append(c); last = c
-                    if tapOn { logitsOut.append(lg) }
                 }
-                return codes + logitsOut
+                return codes
             }
         }
         let out = store.frame!([codeHidden, nextToken])
-        if tapOn, let tap = qwen3TTSCPLogitsTap {
-            for i in 0 ..< nGroups - 1 { tap(i, out[nGroups - 1 + i]) }
-        }
         return Array(out.prefix(nGroups - 1))
     }
 
@@ -137,7 +130,6 @@ extension Qwen3TTSModel {
         let store = Qwen3CPCompileStore.shared
         let key = cpStoreKey(1, temperature, topP, topK, minP)
         if store.key != key { store.key = key; store.frame = nil; store.sub = [:] }
-        let tapOn = qwen3TTSCPLogitsTap != nil
         let cp = talker.codePredictor
         let nLayers = cp.model.layers.count
         if store.sub[codeIdx] == nil {
@@ -154,7 +146,7 @@ extension Qwen3TTSModel {
                 }
                 let (lg, nk, nv) = cp.stepFunctional(input, kc: kIn, vc: vIn, generationStep: codeIdx)
                 let c = self.sampleToken(lg, temperature: temperature, topP: topP, topK: topK, minP: minP)
-                return [c] + nk + nv + (tapOn ? [lg] : [])
+                return [c] + nk + nv
             }
         }
         var args: [MLXArray]
@@ -166,7 +158,6 @@ extension Qwen3TTSModel {
         let out = store.sub[codeIdx]!(args)
         kc = (0 ..< nLayers).map { out[1 + $0] }
         vc = (0 ..< nLayers).map { out[1 + nLayers + $0] }
-        if tapOn, let tap = qwen3TTSCPLogitsTap { tap(codeIdx, out[1 + 2 * nLayers]) }
         return out[0]
     }
 }
