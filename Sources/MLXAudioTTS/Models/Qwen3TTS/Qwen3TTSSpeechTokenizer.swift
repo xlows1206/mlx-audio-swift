@@ -31,6 +31,9 @@ final class VectorQuantization: Module {
     }
 }
 
+/// SCRATCH (voicepack-check): when true, RVQ decode accumulates in the layer dtype (fp16) instead of fp32.
+nonisolated(unsafe) public var qwen3TTSKeepRVQDtype = false
+
 final class ResidualVectorQuantization: Module {
     @ModuleInfo var layers: [VectorQuantization]
 
@@ -42,13 +45,18 @@ final class ResidualVectorQuantization: Module {
 
     func decode(_ codes: MLXArray) -> MLXArray {
         // codes: [num_quantizers, batch, time]
-        var quantized = MLXArray.zeros([codes.dim(1), layers[0].codebookDim, codes.dim(2)])
+        // SCRATCH (voicepack-check): optional keep-dtype accumulator. Stock code starts from a float32 zeros
+        // tensor, which promotes the whole decoder to float32 even with float16 weights.
+        var quantized: MLXArray? = qwen3TTSKeepRVQDtype
+            ? nil
+            : MLXArray.zeros([codes.dim(1), layers[0].codebookDim, codes.dim(2)])
         for (idx, layer) in layers.enumerated() {
             // Codes can be transposed views; avoid scalar gather's empty Metal metadata.
             let layerCodes = codes[idx..<(idx + 1)].squeezed(axis: 0)
-            quantized = quantized + layer.decode(layerCodes)
+            let x = layer.decode(layerCodes)
+            quantized = quantized.map { $0 + x } ?? x
         }
-        return quantized
+        return quantized!
     }
 }
 
@@ -1039,7 +1047,7 @@ final class Qwen3TTSSpeechTokenizer: Module {
     @ModuleInfo var decoder: Qwen3TTSSpeechTokenizerDecoder
     @ModuleInfo(key: "encoder_model") var encoderModel: Qwen3TTSSpeechTokenizerEncoder?
 
-    init(config: Qwen3TTSTokenizerConfig) {
+    init(config: Qwen3TTSTokenizerConfig, buildEncoder: Bool = true) { // SCRATCH (voicepack-check): buildEncoder
         self.config = config
         self.decodeUpsampleRate = config.decodeUpsampleRate
         let decoderConfig = config.decoderConfig ?? {
@@ -1047,7 +1055,7 @@ final class Qwen3TTSSpeechTokenizer: Module {
             return try! JSONDecoder().decode(Qwen3TTSTokenizerDecoderConfig.self, from: json)
         }()
         _decoder.wrappedValue = Qwen3TTSSpeechTokenizerDecoder(config: decoderConfig)
-        if let encoderConfig = config.encoderConfig {
+        if buildEncoder, let encoderConfig = config.encoderConfig {
             _encoderModel.wrappedValue = Qwen3TTSSpeechTokenizerEncoder(
                 config: encoderConfig,
                 validNumQuantizers: config.encoderValidNumQuantizers

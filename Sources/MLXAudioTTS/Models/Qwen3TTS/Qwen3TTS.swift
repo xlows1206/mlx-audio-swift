@@ -6,12 +6,68 @@ import MLXAudioCore
 import MLXNN
 import Tokenizers
 
+// MARK: SCRATCH (phone15p) stage profiler
+public final class Qwen3Prof: @unchecked Sendable {
+    public static let shared = Qwen3Prof()
+    public var enabled = false
+    public var prepMs = 0.0
+    public var prefillTalkerMs = 0.0
+    public var talkerMs: [Double] = []
+    public var cpMs: [Double] = []
+    public var cp1Ms: [Double] = []
+    public var cpSubMs: [Double] = []
+    public var embMs: [Double] = []
+    public var frameMs: [Double] = []
+    public var decMs: [Double] = []
+    public var decFrames: [Int] = []
+    public var memAct: [String: [Int]] = [:]
+    public var memPeak: [String: [Int]] = [:]
+    /// read active + peak (peak since previous rec), then reset peak so the next stage gets its own peak
+    public func rec(_ k: String) {
+        let a = Memory.activeMemory
+        let p = Memory.peakMemory
+        Memory.peakMemory = 0
+        memAct[k, default: []].append(a)
+        memPeak[k, default: []].append(p)
+    }
+    public func reset() {
+        memAct = [:]; memPeak = [:]
+        prepMs = 0; prefillTalkerMs = 0
+        talkerMs = []; cpMs = []; cp1Ms = []; cpSubMs = []; embMs = []; frameMs = []; decMs = []; decFrames = []
+    }
+    @inline(__always) static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+    @inline(__always) static func ms(_ a: UInt64, _ b: UInt64) -> Double { Double(b &- a) / 1e6 }
+}
+
 // MARK: - Qwen3TTS Model
 
 public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Sendable {
     let config: Qwen3TTSModelConfig
     let talker: Qwen3TTSTalkerForConditionalGeneration
     var speakerEncoder: Qwen3TTSSpeakerEncoder?
+
+    // MARK: SCRATCH (voicepack-check) debug surface
+    public var debugLastPrefill: String = ""
+    public var debugLastDecodeCodes: MLXArray?
+    public var debugHasEncoder: Bool { speechTokenizer?.hasEncoder ?? false }
+    public var debugHasSpeakerEncoder: Bool { speakerEncoder != nil }
+    public var debugTextEmbeddingType: String { String(describing: type(of: talker.getTextEmbeddings())) }
+    public var debugCodecEmbeddingType: String { String(describing: type(of: talker.getInputEmbeddings())) }
+    public var debugCodePredictorEmbeddingType: String { String(describing: type(of: talker.codePredictor.codecEmbedding[0])) }
+    public var debugEmbeddingDType: DType {
+        talker.getInputEmbeddings()(MLXArray([Int32(0)]).reshaped(1, 1)).dtype
+    }
+    public func debugEncodeRefText(_ refText: String) -> [Int32] {
+        guard let tokenizer else { return [] }
+        let ids = tokenizer.encode(text: "<|im_start|>assistant\n\(refText)<|im_end|>\n").map { Int32($0) }
+        let s = min(3, ids.count)
+        let e = max(s, ids.count - 2)
+        return Array(ids[s ..< e])
+    }
+    public func debugCodecLanguageID(_ lang: String) -> Int? {
+        config.talkerConfig?.codecLanguageId?[lang.lowercased()]
+    }
+    public func debugDecode(_ codes: MLXArray) -> MLXArray { decodeChunk(codes) }
     var speechTokenizer: Qwen3TTSSpeechTokenizer?
     var tokenizer: Tokenizers.Tokenizer?
 
@@ -330,6 +386,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
 
         let talkerConfig = config.talkerConfig!
+        let P = Qwen3Prof.shared
+        let pOn = P.enabled
+        let tPrep0: UInt64 = pOn ? Qwen3Prof.now() : 0
+        if pOn { Memory.peakMemory = 0 }
 
         // Prepare inputs
         let inputEmbedsInit: MLXArray
@@ -377,6 +437,12 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             refCodes = nil
         }
 
+        if pOn {
+            eval(inputEmbedsInit, trailingTextHidden, ttsPadEmbed)
+            P.prepMs = Qwen3Prof.ms(tPrep0, Qwen3Prof.now())
+            P.rec("prep")
+        }
+
         // Cap max tokens based on text length
         let targetTokenCount = tokenizer.encode(text: text).count
         let effectiveMaxTokens = min(maxTokens, max(75, targetTokenCount * 6))
@@ -413,6 +479,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         for step in 0 ..< effectiveMaxTokens {
             try Task.checkCancellation()
+            let tFrame0: UInt64 = pOn ? Qwen3Prof.now() : 0
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
 
@@ -431,6 +498,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
             // Defer sync to the eval boundary with inputEmbeds.
             let isEOS = nextToken .== eosTokenArray
+            var tC: UInt64 = 0
+            if pOn {
+                eval(nextToken, hidden)
+                tC = Qwen3Prof.now()
+                let d = Qwen3Prof.ms(tFrame0, tC)
+                if step == 0 { P.prefillTalkerMs = d } else { P.talkerMs.append(d) }
+                P.rec(step == 0 ? "prefill" : "talker")
+                tC = Qwen3Prof.now()
+            }
+            var cpSum = 0.0
+            var cp1 = 0.0
 
             // Generate remaining codebook tokens with code predictor
             var codeTokens = [nextToken]
@@ -439,7 +517,31 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 _ = layerCache.trim(layerCache.offset)
             }
 
+            let cpMode = qwen3TTSCompileCP // SCRATCH (cpcompile)
+            if cpMode == 2 {
+                codeTokens.append(contentsOf: cpCompiledFrame(
+                    codeHidden: codeHidden, nextToken: nextToken,
+                    temperature: temperature, topP: topP, topK: topK, minP: minP))
+                if pOn {
+                    eval(codeTokens)
+                    let t = Qwen3Prof.now()
+                    let d = Qwen3Prof.ms(tC, t)
+                    tC = t
+                    cpSum += d
+                    cp1 = d
+                    P.cpSubMs.append(d)
+                }
+            } else {
+            var cpK = [MLXArray?](repeating: nil, count: talker.codePredictor.model.layers.count) // SCRATCH (cpcompile), mode 1 only
+            var cpV = cpK
             for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
+                let nextCode: MLXArray
+                if cpMode == 1 {
+                    nextCode = cpCompiledSubstep(
+                        codeIdx: codeIdx, codeHidden: codeHidden, nextToken: nextToken,
+                        prevToken: codeTokens.last!, kc: &cpK, vc: &cpV,
+                        temperature: temperature, topP: topP, topK: topK, minP: minP)
+                } else {
                 let codeInput: MLXArray
                 if codeIdx == 0 {
                     let code0Embed = talker.getInputEmbeddings()(nextToken)
@@ -451,16 +553,29 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 let (codeLogits, _, _) = talker.codePredictor(
                     codeInput, cache: codeCache, generationStep: codeIdx
                 )
+                if let tap = qwen3TTSCPLogitsTap { tap(codeIdx, codeLogits) } // SCRATCH (cpcompile)
 
-                let nextCode = sampleToken(
+                nextCode = sampleToken(
                     codeLogits,
                     temperature: temperature,
                     topP: topP,
                     topK: topK,
                     minP: minP
                 )
+                }
                 codeTokens.append(nextCode)
+                if pOn {
+                    eval(nextCode)
+                    let t = Qwen3Prof.now()
+                    let d = Qwen3Prof.ms(tC, t)
+                    tC = t
+                    cpSum += d
+                    if codeIdx == 0 { cp1 = d }
+                    P.cpSubMs.append(d)
+                }
             }
+            }
+            if pOn { P.cpMs.append(cpSum); P.cp1Ms.append(cp1); P.rec("cp"); tC = Qwen3Prof.now() }
 
             let allCodes = concatenated(codeTokens, axis: 1) // [1, num_code_groups]
 
@@ -481,6 +596,12 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
             inputEmbeds = textEmbed + codecEmbed
             eval(inputEmbeds, isEOS)
+            if pOn {
+                let t = Qwen3Prof.now()
+                P.embMs.append(Qwen3Prof.ms(tC, t))
+                P.frameMs.append(Qwen3Prof.ms(tFrame0, t))
+                P.rec("emb")
+            }
 
             let tokenId = Int(nextToken[0, 0].item(Int32.self))
             onToken?(tokenId)
@@ -497,9 +618,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                     let codesForDecoder = codesChunk.transposed(0, 2, 1)
                     eval(codesForDecoder)
+                    let tD0: UInt64 = pOn ? Qwen3Prof.now() : 0
                     let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
                     let audioChunk = decoded[0]
                     eval(audioChunk)
+                    if pOn { P.decMs.append(Qwen3Prof.ms(tD0, Qwen3Prof.now())); P.decFrames.append(newTokens); P.rec("dec") }
 
                     decodedTokens = generatedCodes.count
                     onAudioChunk(audioChunk)
@@ -537,9 +660,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                 let codesForDecoder = codesChunk.transposed(0, 2, 1)
                 eval(codesForDecoder)
+                let tD0: UInt64 = pOn ? Qwen3Prof.now() : 0
                 let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
                 let audioChunk = decoded[0]
                 eval(audioChunk)
+                if pOn { P.decMs.append(Qwen3Prof.ms(tD0, Qwen3Prof.now())); P.decFrames.append(generatedCodes.count - decodedTokens); P.rec("dec") }
                 onAudioChunk(audioChunk)
             }
             // Streaming chunks already yielded; return empty (caller uses chunks)
@@ -555,6 +680,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             decodeCodes = concatenated([refCodesT, codes], axis: 1)
         }
 
+        debugLastDecodeCodes = decodeCodes // SCRATCH (voicepack-check)
         var audio = decodeChunk(decodeCodes)
 
         if let refCodes {
@@ -835,6 +961,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         let inputEmbeds = concatenated([roleEmbed, combinedPrefix, iclInputEmbed], axis: 1)
 
+        // SCRATCH (voicepack-check): prove the reference codes really are in the prefill.
+        // total = role(3) + combinedPrefix(codecPrefix-1) + textWithCodecPad(textLen) + codecWithTextPad(1 + refFrames)
+        debugLastPrefill = "inputEmbeds=\(inputEmbeds.shape) dtype=\(inputEmbeds.dtype) "
+            + "refCodes=\(refCodes.shape) refTextIds=\(conditioning.referenceTextTokenIDs.shape) "
+            + "targetTextIds=\(targetTextIds.shape) textLen(ref+target+eos)=\(textLen) "
+            + "codecEmbedIcl=\(codecEmbedIcl.shape) codecPrefix=\(codecPrefixEmbed.dim(1)) "
+            + "speakerEmbed=\(conditioning.speakerEmbedding.map { "\($0.shape) \($0.dtype)" } ?? "nil") "
+            + "expectedTotal=\(3 + (codecPrefixEmbed.dim(1) - 1) + textLen + codecEmbedIcl.dim(1))"
         return (inputEmbeds, trailingTextHidden, ttsPadEmbed, refCodes)
     }
 
@@ -1233,6 +1367,12 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     eval(speakerEncoder.parameters())
                 }
             }
+            if speakerWeights.isEmpty, model.speakerEncoder != nil {
+                // SCRATCH (voicepack-check): checkpoint ships no speaker_encoder.* weights (voice-pack model):
+                // drop the randomly-initialised encoder instead of pretending it is loaded.
+                model.speakerEncoder = nil
+                print("No speaker_encoder weights in checkpoint -> speakerEncoder = nil")
+            }
             if model.speakerEncoder != nil {
                 print("Loaded speaker encoder")
             } else {
@@ -1256,18 +1396,27 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             tokenizerConfig = try JSONDecoder().decode(Qwen3TTSTokenizerConfig.self, from: defaultJson)
         }
 
-        let speechTokenizer = Qwen3TTSSpeechTokenizer(config: tokenizerConfig)
-
-        // Load weights
+        // Load weights first (SCRATCH voicepack-check: need to know whether encoder weights exist before building)
         var tokenizerWeights = [String: MLXArray]()
         let files = try FileManager.default.contentsOfDirectory(at: path, includingPropertiesForKeys: nil)
         for file in files where file.pathExtension == "safetensors" {
             let weights = try MLX.loadArrays(url: file)
             tokenizerWeights.merge(weights) { _, new in new }
         }
+        let sanitized = tokenizerWeights.isEmpty ? [:] : Qwen3TTSSpeechTokenizer.sanitize(weights: tokenizerWeights)
+
+        // SCRATCH (voicepack-check): config still declares encoder_config but the weights were stripped
+        // (voice-pack model). Do not build the encoder, otherwise `verify: .all` fails on missing keys.
+        let hasEncoderWeights = sanitized.keys.contains { $0.hasPrefix("encoder_model.") }
+        if tokenizerConfig.encoderConfig != nil, !hasEncoderWeights {
+            print("No encoder_model.* weights in speech_tokenizer -> encoder not built (hasEncoder=false)")
+        }
+        let speechTokenizer = Qwen3TTSSpeechTokenizer(
+            config: tokenizerConfig,
+            buildEncoder: tokenizerWeights.isEmpty || hasEncoderWeights || ProcessInfo.processInfo.environment["VP_STOCK_LOADER"] == "1" // env switch only to reproduce stock failure
+        )
 
         if !tokenizerWeights.isEmpty {
-            let sanitized = Qwen3TTSSpeechTokenizer.sanitize(weights: tokenizerWeights)
             let pairs = sanitized.map { ($0.key, $0.value) }
             try speechTokenizer.update(parameters: ModuleParameters.unflattened(pairs), verify: .all)
             eval(speechTokenizer.parameters())
