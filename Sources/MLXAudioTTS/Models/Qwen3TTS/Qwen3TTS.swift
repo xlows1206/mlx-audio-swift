@@ -16,6 +16,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     // MARK: Diagnostics surface (read-only; used by the host app to verify the loaded configuration)
     /// Summary of the last prefill (shapes + dtype), proving which conditioning went in.
     public var debugLastPrefill: String = ""
+    private let generationReportBox = Qwen3TTSReportBox()
+    /// Report of the most recent generation (yuitalk2 #237). `nil` at the start of every
+    /// generation and when the generation was cancelled; written once on normal completion
+    /// (including a cap hit), before the stream finishes. Independent of the EOS-guard switches.
+    public var lastGenerationReport: Qwen3TTSGenerationReport? { generationReportBox.value }
     public var debugHasEncoder: Bool { speechTokenizer?.hasEncoder ?? false }
     public var debugHasSpeakerEncoder: Bool { speakerEncoder != nil }
     /// dtype of the talker's input embeddings (what the prefill is built from).
@@ -390,9 +395,24 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             refCodes = nil
         }
 
+        // Snapshot the EOS-guard switches once; they are not read again during this generation.
+        let guardConfig = qwen3TTSEOSGuard
+        let guardActive = guardConfig.eosBias != 0 || guardConfig.capEnabled
+        let mora = guardActive ? Qwen3TTSEOSGuard.moraCount(text) : 0
+        let eosBiasMinFrames = guardConfig.eosBias != 0
+            ? Qwen3TTSEOSGuard.minFrames(mora: mora, config: guardConfig) : Int.max
+        var eosBiased = false
+        var sawEOS = false
+
         // Cap max tokens based on text length
         let targetTokenCount = tokenizer.encode(text: text).count
-        let effectiveMaxTokens = min(maxTokens, max(75, targetTokenCount * 6))
+        let effectiveMaxTokens: Int
+        if guardConfig.capEnabled {
+            effectiveMaxTokens = Qwen3TTSEOSGuard.effectiveMaxTokens(
+                maxTokens: maxTokens, targetTokenCount: targetTokenCount, mora: mora, config: guardConfig)
+        } else {
+            effectiveMaxTokens = min(maxTokens, max(75, targetTokenCount * 6))
+        }
 
         // Initialize cache and timing
         let startTime = Date()
@@ -415,6 +435,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
 
+        generationReportBox.value = nil
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
         }
@@ -429,6 +450,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
 
+            // EOS bias applies to the main codebook only, once `step` frames have been produced.
+            let applyEOSBias = step >= eosBiasMinFrames
+            if applyEOSBias { eosBiased = true }
+
             // Sample first codebook token
             let nextToken = sampleToken(
                 logits,
@@ -439,7 +464,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 generatedTokens: generatedCodebookTokens,
                 suppressTokens: suppressTokens,
                 eosTokenId: eosTokenId,
-                minP: minP
+                minP: minP,
+                eosBias: applyEOSBias ? guardConfig.eosBias : 0
             )
 
             // Defer sync to the eval boundary with inputEmbeds.
@@ -515,6 +541,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             let tokenId = Int(nextToken[0, 0].item(Int32.self))
             onToken?(tokenId)
             if isEOS.item(Bool.self) {
+                sawEOS = true
                 break
             }
             generatedCodebookTokens.append(tokenId)
@@ -543,6 +570,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         try Task.checkCancellation()
 
+        // The loop ran out without EOS: record the failure and stop. No retry, no throw. With the
+        // cap enabled the (<= 2) undecoded tail frames, the most suspect ones, are not flushed.
+        // With the cap disabled the legacy path is untouched, so it still flushes.
+        let hitCap = !sawEOS
+        generationReportBox.value = Qwen3TTSGenerationReport(
+            frames: generatedCodes.count,
+            cap: guardConfig.capEnabled ? effectiveMaxTokens : nil,
+            hitCap: hitCap,
+            eosBiased: eosBiased
+        )
+
         guard !generatedCodes.isEmpty else {
             return MLXArray.zeros([1])
         }
@@ -563,7 +601,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         // Streaming path: yield remaining tokens and return early
         if let onAudioChunk {
-            if generatedCodes.count > decodedTokens {
+            let skipTailFlush = guardConfig.capEnabled && hitCap
+            if !skipTailFlush, generatedCodes.count > decodedTokens {
                 let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                 let codesForDecoder = codesChunk.transposed(0, 2, 1)
                 eval(codesForDecoder)
@@ -1049,7 +1088,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         generatedTokens: [Int]? = nil,
         suppressTokens: [Int]? = nil,
         eosTokenId: Int? = nil,
-        minP: Float = 0.0
+        minP: Float = 0.0,
+        eosBias: Float = 0
     ) -> MLXArray {
         var logitsSlice = logits[0..., (-1)..., 0...].squeezed(axis: 1) // [batch, vocab_size]
 
@@ -1078,6 +1118,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         // Greedy if temperature 0
         if temperature <= 0 {
             return argMax(logitsSlice, axis: -1, keepDims: true)
+        }
+
+        // EOS bias (yuitalk2 #237): after suppress + repetition penalty, BEFORE the EOS logit is
+        // saved below, so the value written back after top-k/top-p/min-p carries the bias.
+        // `eosBias == 0` builds no ops at all.
+        if eosBias != 0, let eosTokenId, eosTokenId >= 0, eosTokenId < logitsSlice.dim(-1) {
+            let eosIdx = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
+            let biased = logitsSlice[0..., eosTokenId ..< (eosTokenId + 1)]
+                + MLXArray(eosBias).asType(logitsSlice.dtype)
+            logitsSlice = putAlong(logitsSlice, eosIdx, values: biased, axis: -1)
         }
 
         // Preserve EOS logit so top-k/top-p/min-p do not permanently suppress it.
