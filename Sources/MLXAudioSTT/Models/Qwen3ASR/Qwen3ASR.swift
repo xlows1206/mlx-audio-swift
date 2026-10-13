@@ -19,6 +19,18 @@ struct UncheckedSendableBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
+/// Measurement variants preserve the pinned cdf455a behavior as the default.
+/// Dtype harmonization is experimental until paired real-audio quality passes.
+public enum Qwen3ASRLatencyVariant: String, Sendable {
+    case baseline, prefill, prefillDtype
+}
+
+public struct Qwen3ASRLatencyDiagnostics: Sendable {
+    public var seconds: [String: Double] = [:]
+    public var values: [String: String] = [:]
+    public init() {}
+}
+
 // MARK: - Helper Functions
 
 private func floorDiv(_ a: MLXArray, _ b: Int) -> MLXArray {
@@ -397,6 +409,8 @@ public class Qwen3ASRAudioEncoder: Module {
     let nWindow: Int
     let nWindowInfer: Int
 
+    public var harmonizeBoundaryDtype = false
+    public var recordDtype: ((String, String) -> Void)?
     @ModuleInfo(key: "conv2d1") var conv2d1: Conv2d
     @ModuleInfo(key: "conv2d2") var conv2d2: Conv2d
     @ModuleInfo(key: "conv2d3") var conv2d3: Conv2d
@@ -548,6 +562,10 @@ public class Qwen3ASRAudioEncoder: Module {
 
             // [batchLen, n_mels, paddedChunkLen, 1]
             var x = MLX.stacked(batchSlice, axis: 0).expandedDimensions(axis: -1)
+            recordDtype?("mel", String(describing: x.dtype))
+            recordDtype?("conv_weight", String(describing: conv2d1.weight.dtype))
+            if harmonizeBoundaryDtype { x = x.asType(conv2d1.weight.dtype) }
+            recordDtype?("conv_input", String(describing: x.dtype))
             x = gelu(conv2d1(x))
             x = gelu(conv2d2(x))
             x = gelu(conv2d3(x))
@@ -560,7 +578,11 @@ public class Qwen3ASRAudioEncoder: Module {
             x = convOut(x)  // [batchLen, t, d_model]
 
             // Add positional embeddings
-            let posEmb = positionalEmbedding(x.dim(1))
+            recordDtype?("conv_output", String(describing: x.dtype))
+            var posEmb = positionalEmbedding(x.dim(1))
+            recordDtype?("positional_original", String(describing: posEmb.dtype))
+            if harmonizeBoundaryDtype { posEmb = posEmb.asType(x.dtype) }
+            recordDtype?("positional_added", String(describing: posEmb.dtype))
             x = x + posEmb.expandedDimensions(axis: 0)
 
             eval(x) 
@@ -939,6 +961,11 @@ public class Qwen3ASRModel: Module {
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public var tokenizer: Tokenizers.Tokenizer?
+    public var latencyVariant: Qwen3ASRLatencyVariant = .baseline
+    public var collectLatencyDiagnostics = false
+    /// Smaller values only for explicit multi-chunk equivalence replay.
+    public var latencyPrefillStepSize = 2048
+    public private(set) var latencyDiagnostics = Qwen3ASRLatencyDiagnostics()
 
     /// Sample rate expected by the model (16kHz).
     public let sampleRate: Int = 16000
@@ -1213,6 +1240,18 @@ public class Qwen3ASRModel: Module {
         }
     }
 
+    /// Prefix-only transformer update. Cache arrays are materialized before returning.
+    /// The default baseline retains the original full-prefix projection for comparison.
+    public func prefillPrefix(inputEmbeddings: MLXArray, cache: [KVCache]) {
+        let hidden = model(inputsEmbeds: inputEmbeddings, cache: cache)
+        if latencyVariant == .baseline {
+            let logits = lmHead.map { $0(hidden) } ?? model.embedTokens.asLinear(hidden)
+            eval(logits)
+        } else {
+            eval(cache.flatMap { $0.state })
+        }
+    }
+
     // MARK: - Single Chunk Generation (internal)
 
     private func generateSingleChunk(
@@ -1229,9 +1268,23 @@ public class Qwen3ASRModel: Module {
         }
 
         let eosTokenIds = [151645, 151643]
-        let prefillStepSize = 2048
+        let prefillStepSize = max(1, latencyPrefillStepSize)
 
+        latencyDiagnostics = Qwen3ASRLatencyDiagnostics()
+        let recognitionStart = Date()
+        var phaseStart = Date()
+        audioTower.harmonizeBoundaryDtype = latencyVariant == .prefillDtype
+        audioTower.recordDtype = collectLatencyDiagnostics ? { [weak self] key, value in
+            self?.latencyDiagnostics.values[key] = value
+        } : nil
         let (inputFeatures, featureAttentionMask, numAudioTokens) = preprocessAudio(audio)
+        if collectLatencyDiagnostics {
+            eval(inputFeatures, featureAttentionMask)
+            latencyDiagnostics.seconds["feature_mel"] = Date().timeIntervalSince(phaseStart)
+            latencyDiagnostics.values["audio_samples"] = String(audio.size)
+            latencyDiagnostics.values["mel_frames"] = String(inputFeatures.dim(-1))
+        }
+        phaseStart = Date()
         let inputIds = buildPrompt(
             numAudioTokens: numAudioTokens,
             context: context,
@@ -1239,8 +1292,19 @@ public class Qwen3ASRModel: Module {
         )
         let promptTokenCount = inputIds.dim(1)
 
+        if collectLatencyDiagnostics {
+            latencyDiagnostics.seconds["prompt_build"] = Date().timeIntervalSince(phaseStart)
+        }
+        phaseStart = Date()
         let audioFeatures = getAudioFeatures(inputFeatures, featureAttentionMask: featureAttentionMask)
         eval(audioFeatures)
+        if collectLatencyDiagnostics {
+            latencyDiagnostics.seconds["encoder"] = Date().timeIntervalSince(phaseStart)
+            latencyDiagnostics.values["encoder_output"] = String(describing: audioFeatures.dtype)
+            latencyDiagnostics.values["audio_tokens"] = String(numAudioTokens)
+            latencyDiagnostics.values["prompt_tokens"] = String(promptTokenCount)
+        }
+        phaseStart = Date()
 
         let embeds = model.embedTokens(inputIds)
         let inputsEmbeds = mergeAudioFeatures(
@@ -1249,6 +1313,12 @@ public class Qwen3ASRModel: Module {
             inputIds: inputIds
         )
 
+        if collectLatencyDiagnostics {
+            eval(inputsEmbeds)
+            latencyDiagnostics.seconds["embedding_merge"] = Date().timeIntervalSince(phaseStart)
+            latencyDiagnostics.values["decoder_embeddings"] = String(describing: inputsEmbeds.dtype)
+        }
+        phaseStart = Date()
         let cache = makeCache()
 
         // Chunked prefill (mlx-lm.generate_step pattern): keeps lazy graph small,
@@ -1258,26 +1328,37 @@ public class Qwen3ASRModel: Module {
         while totalTokens - processedTokens > 1 {
             let remaining = (totalTokens - processedTokens) - 1
             let n = min(prefillStepSize, remaining)
-            let chunkIds = inputIds[0..., processedTokens..<(processedTokens + n)]
             let chunkEmbeds = inputsEmbeds[0..., processedTokens..<(processedTokens + n), 0...]
-            let chunkLogits = callAsFunction(
-                inputIds: chunkIds,
-                inputEmbeddings: chunkEmbeds,
-                cache: cache
-            )
-            eval(chunkLogits)
+            prefillPrefix(inputEmbeddings: chunkEmbeds, cache: cache)
             Memory.clearCache()
             processedTokens += n
         }
 
-        let lastIds = inputIds[0..., processedTokens..<totalTokens]
+        if collectLatencyDiagnostics {
+            latencyDiagnostics.seconds["prefix_prefill"] = Date().timeIntervalSince(phaseStart)
+            latencyDiagnostics.values["prefill_step_size"] = String(prefillStepSize)
+            latencyDiagnostics.values["prefix_tokens"] = String(processedTokens)
+            latencyDiagnostics.values["prefix_chunks"] = String((processedTokens + prefillStepSize - 1) / prefillStepSize)
+            latencyDiagnostics.values["prefix_vocabulary_projection"] = latencyVariant == .baseline ? "all_prefix_positions" : "none"
+            latencyDiagnostics.values["cache_offsets"] = cache.map { String($0.offset) }.joined(separator: ",")
+        }
+        phaseStart = Date()
         let lastEmbeds = inputsEmbeds[0..., processedTokens..<totalTokens, 0...]
-        let firstLogits = callAsFunction(
-            inputIds: lastIds,
-            inputEmbeddings: lastEmbeds,
-            cache: cache
-        )
-
+        let finalHidden = model(inputsEmbeds: lastEmbeds, cache: cache)
+        if collectLatencyDiagnostics {
+            eval(finalHidden)
+            latencyDiagnostics.seconds["final_prompt_transformer"] = Date().timeIntervalSince(phaseStart)
+        }
+        phaseStart = Date()
+        let firstLogits = lmHead.map { $0(finalHidden) } ?? model.embedTokens.asLinear(finalHidden)
+        if collectLatencyDiagnostics {
+            eval(firstLogits)
+            latencyDiagnostics.seconds["final_vocabulary_projection"] = Date().timeIntervalSince(phaseStart)
+            latencyDiagnostics.values["decoder_hidden"] = String(describing: finalHidden.dtype)
+            latencyDiagnostics.values["decoder_logits"] = String(describing: firstLogits.dtype)
+            latencyDiagnostics.values["final_logits_sum"] = String(firstLogits.sum().item(Float.self))
+        }
+        phaseStart = Date()
         var firstLast = firstLogits[0..., -1, 0...]
         if temperature > 0 {
             firstLast = firstLast / temperature
@@ -1343,6 +1424,13 @@ public class Qwen3ASRModel: Module {
             }
         }
 
+        if collectLatencyDiagnostics {
+            latencyDiagnostics.seconds["autoregressive_decode"] = Date().timeIntervalSince(phaseStart)
+            latencyDiagnostics.seconds["instrumented_generation"] = Date().timeIntervalSince(recognitionStart)
+            latencyDiagnostics.values["generation_tokens"] = String(generatedTokens.count)
+            latencyDiagnostics.values["variant"] = latencyVariant.rawValue
+            latencyDiagnostics.values["peak_mlx_bytes"] = String(Memory.peakMemory)
+        }
         let decodedText = tokenizer.decode(tokens: generatedTokens)
         let parsed = parseGeneratedChunk(decodedText, forcedLanguage: language)
 
